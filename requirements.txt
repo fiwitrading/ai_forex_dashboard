@@ -1,0 +1,5 @@
+streamlit
+feedparser
+transformers
+torch
+pandas
