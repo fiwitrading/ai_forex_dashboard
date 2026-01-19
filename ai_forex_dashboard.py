@@ -47,4 +47,4 @@ for item in news_items:
     title_lower = item["title"].lower()
     if any(k in title_lower for k in ["usd", "fed", "america", "us dollar"]):
         pair = "EUR/USD"
-    elif any(k in title_lower for k in ["uk", "pound"],):
+    elif any(k in title_lower for k in ["uk", "pound"]):
