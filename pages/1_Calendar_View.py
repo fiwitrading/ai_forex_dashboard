@@ -10,7 +10,7 @@ st.title("🗓️ Economic News Calendar (AI Source: NewsData.io)")
 st.caption("Live macroeconomic headlines classified by impact and currency relevance")
 
 # === API CONFIG ===
-# Recomandare: mută cheia în st.secrets["NEWSDATA_API_KEY"]
+# Recomandare: mută cheia în st.secrets['NEWSDATA_API_KEY']
 API_KEY = st.secrets.get("NEWSDATA_API_KEY", "pub_509adedfa35443b3aac899dc0fcd9f14")
 BASE_URL = "https://newsdata.io/api/1/news"
 
@@ -23,7 +23,6 @@ def convert_to_local_time(utc_time_value, target_tz="Europe/Bucharest"):
         # Dacă e deja datetime
         if isinstance(utc_time_value, datetime):
             utc_dt = utc_time_value
-            # dacă datetime e naive, considerăm UTC
             if utc_dt.tzinfo is None:
                 utc_dt = pytz.utc.localize(utc_dt)
         else:
@@ -35,7 +34,6 @@ def convert_to_local_time(utc_time_value, target_tz="Europe/Bucharest"):
                 utc_dt = pd.to_datetime(s, errors="coerce")
                 if pd.isna(utc_dt):
                     return "N/A"
-                # localize fallback ca UTC
                 try:
                     utc_dt = utc_dt.tz_localize(pytz.utc)
                 except Exception:
@@ -46,9 +44,9 @@ def convert_to_local_time(utc_time_value, target_tz="Europe/Bucharest"):
     except Exception:
         return "N/A"
 
-# === FETCH ȘTIRI ===
+# === BUILD QUERY & PARAMS ===
 query = "economy OR inflation OR interest rates OR forex OR central bank OR CPI OR GDP OR unemployment"
-params = {
+base_params = {
     "apikey": API_KEY,
     "language": "en",
     "q": query,
@@ -57,19 +55,63 @@ params = {
 
 st.info("Fetching latest economic headlines...")
 
-try:
-    response = requests.get(BASE_URL, params=params, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-except Exception as e:
-    st.error(f"Error fetching data: {e}")
+def try_request(params):
+    try:
+        resp = requests.get(BASE_URL, params=params, timeout=15)
+    except Exception as e:
+        st.error(f"Network error when calling NewsData: {e}")
+        return None, None
+    content = None
+    try:
+        content = resp.json()
+    except Exception:
+        content = resp.text
+    return resp, content
+
+# 1) Prima încercare: params inițiali
+resp, content = try_request(base_params)
+data = None
+
+# 2) Tratare răspuns / fallback-uri
+if resp is None:
     st.stop()
 
-if "results" not in data or not isinstance(data["results"], list) or len(data["results"]) == 0:
-    st.error("No data fetched from NewsData.io or unexpected response format. Try again later.")
+if resp.status_code != 200:
+    # Afișăm mesajul serverului (json sau text) pentru debugging
+    st.error(f"NewsData API returned status {resp.status_code}: {content}")
+
+    # Dacă 422 sau altă eroare de validare, încercăm fallback-uri
+    if resp.status_code == 422:
+        st.info("Attempting fallback: retrying without 'category' parameter...")
+        params_no_category = base_params.copy()
+        params_no_category.pop("category", None)
+        resp2, content2 = try_request(params_no_category)
+        if resp2 is not None and resp2.status_code == 200:
+            data = content2
+        else:
+            st.error(f"Fallback without category returned status {getattr(resp2, 'status_code', 'N/A')}: {content2}")
+            st.info("Attempting second fallback: simplified query 'economy' ...")
+            params_simple_q = base_params.copy()
+            params_simple_q.pop("category", None)
+            params_simple_q["q"] = "economy"
+            resp3, content3 = try_request(params_simple_q)
+            if resp3 is not None and resp3.status_code == 200:
+                data = content3
+            else:
+                st.error(f"Simplified query fallback returned status {getattr(resp3, 'status_code', 'N/A')}: {content3}")
+                st.stop()
+    else:
+        # alte coduri (401,403,429,500 etc.) — oprim după afișare
+        st.stop()
+else:
+    data = content
+
+# În continuare, 'data' ar trebui să fie dict-ul JSON returnat de API
+if not data or "results" not in data:
+    st.error("No results found in API response or unexpected format. See previous errors above for details.")
     st.stop()
 
-# === PROCESARE ===
+# === PROCESARE RESULTS ===
 events = []
 for idx, item in enumerate(data["results"]):
     # Protecție: unele elemente pot fi None / string etc.
@@ -133,11 +175,10 @@ filtered_df = df[
     (df["Currency"].isin(currency_filter))
 ] if not df.empty else df
 
-# sortare: dacă coloana "Time (local)" are valori "N/A", le queremos la final
+# sortare: dacă coloana "Time (local)" are valori "N/A", le punem la final
 def sort_time_safe(df_in):
     if "Time (local)" not in df_in.columns or df_in.empty:
         return df_in
-    # transformăm în datetime pentru sortare acolo unde e posibil
     times = pd.to_datetime(df_in["Time (local)"], format="%d %b %Y, %H:%M", errors="coerce")
     return df_in.assign(_sort_time=times).sort_values(by="_sort_time", ascending=False).drop(columns=["_sort_time"])
 
