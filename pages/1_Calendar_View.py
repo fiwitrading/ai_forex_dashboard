@@ -10,14 +10,38 @@ st.title("🗓️ Economic News Calendar (AI Source: NewsData.io)")
 st.caption("Live macroeconomic headlines classified by impact and currency relevance")
 
 # === API CONFIG ===
-API_KEY = "pub_509adedfa35443b3aac899dc0fcd9f14"
+# Recomandare: mută cheia în st.secrets["NEWSDATA_API_KEY"]
+API_KEY = st.secrets.get("NEWSDATA_API_KEY", "pub_509adedfa35443b3aac899dc0fcd9f14")
 BASE_URL = "https://newsdata.io/api/1/news"
 
-# === FUNCTIE CONVERSIE ORĂ ===
-def convert_to_local_time(utc_time_str, target_tz="Europe/Bucharest"):
+# === FUNCTIE CONVERSIE ORĂ (mai tolerantă) ===
+def convert_to_local_time(utc_time_value, target_tz="Europe/Bucharest"):
     try:
-        utc_dt = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M:%S")
-        local_dt = utc_dt.replace(tzinfo=pytz.utc).astimezone(pytz.timezone(target_tz))
+        if not utc_time_value:
+            return "N/A"
+
+        # Dacă e deja datetime
+        if isinstance(utc_time_value, datetime):
+            utc_dt = utc_time_value
+            # dacă datetime e naive, considerăm UTC
+            if utc_dt.tzinfo is None:
+                utc_dt = pytz.utc.localize(utc_dt)
+        else:
+            # Folosim pandas pentru parsing tolerant la formate diferite
+            utc_dt = pd.to_datetime(utc_time_value, utc=True, errors="coerce")
+            if pd.isna(utc_dt):
+                # încercare fallback: înlăturăm T și Z
+                s = str(utc_time_value).replace("T", " ").replace("Z", "")
+                utc_dt = pd.to_datetime(s, errors="coerce")
+                if pd.isna(utc_dt):
+                    return "N/A"
+                # localize fallback ca UTC
+                try:
+                    utc_dt = utc_dt.tz_localize(pytz.utc)
+                except Exception:
+                    utc_dt = pd.to_datetime(utc_dt).tz_localize(pytz.utc)
+
+        local_dt = utc_dt.astimezone(pytz.timezone(target_tz))
         return local_dt.strftime("%d %b %Y, %H:%M")
     except Exception:
         return "N/A"
@@ -35,21 +59,29 @@ st.info("Fetching latest economic headlines...")
 
 try:
     response = requests.get(BASE_URL, params=params, timeout=15)
+    response.raise_for_status()
     data = response.json()
 except Exception as e:
     st.error(f"Error fetching data: {e}")
     st.stop()
 
-if "results" not in data or len(data["results"]) == 0:
-    st.error("No data fetched from NewsData.io. Try again later.")
+if "results" not in data or not isinstance(data["results"], list) or len(data["results"]) == 0:
+    st.error("No data fetched from NewsData.io or unexpected response format. Try again later.")
     st.stop()
 
 # === PROCESARE ===
 events = []
-for item in data["results"]:
-    title = item.get("title", "No title")
-    source = item.get("source_id", "Unknown")
-    pub_date = item.get("pubDate", "").replace("T", " ").replace("Z", "")
+for idx, item in enumerate(data["results"]):
+    # Protecție: unele elemente pot fi None / string etc.
+    if not isinstance(item, dict):
+        st.warning(f"Skipping unexpected result at index {idx} (not a dict).")
+        continue
+
+    title = item.get("title") or item.get("headline") or "No title"
+    source = item.get("source_id") or item.get("source") or "Unknown"
+
+    # unele API-uri pot folosi chei diferite pentru dată -> încercăm mai multe variante
+    pub_date_raw = item.get("pubDate") or item.get("pub_date") or item.get("pubdate") or ""
 
     title_lower = title.lower()
     impact = "Low"
@@ -72,7 +104,7 @@ for item in data["results"]:
         country = "🌍 Other"
 
     events.append({
-        "Time (local)": convert_to_local_time(pub_date),
+        "Time (local)": convert_to_local_time(pub_date_raw),
         "Currency": country,
         "Impact": impact,
         "Headline": title,
@@ -88,18 +120,28 @@ impact_filter = st.sidebar.multiselect(
     options=["High", "Medium", "Low"],
     default=["High", "Medium"]
 )
+
+currency_options = sorted(df["Currency"].unique()) if not df.empty else []
 currency_filter = st.sidebar.multiselect(
     "Select currencies:",
-    options=sorted(df["Currency"].unique()),
-    default=sorted(df["Currency"].unique())
+    options=currency_options,
+    default=currency_options
 )
 
 filtered_df = df[
     (df["Impact"].isin(impact_filter)) &
     (df["Currency"].isin(currency_filter))
-]
+] if not df.empty else df
 
-filtered_df = filtered_df.sort_values(by="Time (local)", ascending=False)
+# sortare: dacă coloana "Time (local)" are valori "N/A", le queremos la final
+def sort_time_safe(df_in):
+    if "Time (local)" not in df_in.columns or df_in.empty:
+        return df_in
+    # transformăm în datetime pentru sortare acolo unde e posibil
+    times = pd.to_datetime(df_in["Time (local)"], format="%d %b %Y, %H:%M", errors="coerce")
+    return df_in.assign(_sort_time=times).sort_values(by="_sort_time", ascending=False).drop(columns=["_sort_time"])
+
+filtered_df = sort_time_safe(filtered_df)
 
 # === STILIZARE ===
 def color_impact(val):
@@ -111,11 +153,14 @@ def color_impact(val):
         color = "#16C47F"
     return f"color: {color}; font-weight: bold;"
 
-st.dataframe(
-    filtered_df.style.applymap(color_impact, subset=["Impact"]),
-    use_container_width=True,
-    height=650
-)
+if not filtered_df.empty:
+    st.dataframe(
+        filtered_df.style.applymap(color_impact, subset=["Impact"]),
+        use_container_width=True,
+        height=650
+    )
+else:
+    st.info("No events to display with current filters.")
 
 # === REZUMAT SUS ===
 st.markdown("---")
@@ -124,7 +169,7 @@ count_high = len(df[df["Impact"] == "High"])
 count_medium = len(df[df["Impact"] == "Medium"])
 count_low = len(df[df["Impact"] == "Low"])
 
-top_currency = df["Currency"].value_counts().idxmax()
+top_currency = df["Currency"].value_counts().idxmax() if not df.empty else "N/A"
 
 st.write(
     f"**High Impact:** {count_high} | **Medium:** {count_medium} | **Low:** {count_low} | "
@@ -133,4 +178,4 @@ st.write(
 
 # === BUTON REFRESH ===
 if st.button("🔄 Refresh Data"):
-    st.rerun()
+    st.experimental_rerun()
