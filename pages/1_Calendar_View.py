@@ -58,48 +58,57 @@ for entry in feed.entries:
     })
 
 # === TRANSFORMARE ÎN DATAFRAME ===
-df = pd.DataFrame(events)
+if len(events) == 0:
+    st.error("No data fetched from ForexFactory RSS feed. Try again later.")
+else:
+    df = pd.DataFrame(events)
 
-# === FILTRE ===
-st.sidebar.header("⚙️ Filters")
-impact_filter = st.sidebar.multiselect(
-    "Select impact level:",
-    options=["High", "Medium", "Low"],
-    default=["High", "Medium"]
-)
+    # Asigurare că toate coloanele există
+    expected_cols = ["Time (local)", "Country", "Impact", "Event"]
+    for col in expected_cols:
+        if col not in df.columns:
+            st.error(f"Missing expected column: {col}")
+            st.stop()
 
-country_filter = st.sidebar.multiselect(
-    "Select countries:",
-    options=sorted(df["Country"].unique()),
-    default=sorted(df["Country"].unique())
-)
+    # === FILTRE ===
+    st.sidebar.header("⚙️ Filters")
+    impact_filter = st.sidebar.multiselect(
+        "Select impact level:",
+        options=["High", "Medium", "Low"],
+        default=["High", "Medium"]
+    )
 
-# === APLICARE FILTRE ===
-filtered_df = df[
-    (df["Impact"].isin(impact_filter)) &
-    (df["Country"].isin(country_filter))
-]
+    country_filter = st.sidebar.multiselect(
+        "Select countries:",
+        options=sorted(df["Country"].unique()),
+        default=sorted(df["Country"].unique())
+    )
 
-# === SORTARE DUPĂ TIMP ===
-filtered_df = filtered_df.sort_values(by="Time (local)", ascending=True)
+    # === APLICARE FILTRE ===
+    filtered_df = df[
+        (df["Impact"].isin(impact_filter)) &
+        (df["Country"].isin(country_filter))
+    ]
 
-# === STILIZARE ===
-def color_impact(val):
-    if val == "High":
-        color = "#D44D5C"
-    elif val == "Medium":
-        color = "#E6B800"
-    else:
-        color = "#16C47F"
-    return f"color: {color}; font-weight: bold;"
+    # === SORTARE DUPĂ TIMP ===
+    filtered_df = filtered_df.sort_values(by="Time (local)", ascending=True)
 
-st.dataframe(
-    filtered_df.style.applymap(color_impact, subset=["Impact"]),
-    use_container_width=True,
-    height=600
-)
+    # === STILIZARE ===
+    def color_impact(val):
+        if val == "High":
+            color = "#D44D5C"
+        elif val == "Medium":
+            color = "#E6B800"
+        else:
+            color = "#16C47F"
+        return f"color: {color}; font-weight: bold;"
 
-# === REFRESH BUTTON ===
-if st.button("🔄 Refresh Calendar"):
-    st.rerun()
+    st.dataframe(
+        filtered_df.style.applymap(color_impact, subset=["Impact"]),
+        use_container_width=True,
+        height=600
+    )
 
+    # === REFRESH BUTTON ===
+    if st.button("🔄 Refresh Calendar"):
+        st.rerun()
