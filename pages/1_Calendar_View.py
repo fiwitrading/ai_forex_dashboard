@@ -1,121 +1,107 @@
 import streamlit as st
+import requests
 import pandas as pd
 from datetime import datetime
 import pytz
-import requests
-import feedparser
 
 # === CONFIGURARE PAGINĂ ===
 st.set_page_config(page_title="Economic Calendar", layout="wide")
-st.title("🗓️ Economic Calendar")
-st.caption("Data sources: TradingEconomics • Investing.com • FXStreet — updated automatically")
+st.title("🗓️ Economic News Calendar (AI Source: NewsData.io)")
+st.caption("Live macroeconomic headlines classified by impact and currency relevance")
 
-# === FUNCȚIE CONVERSIE ORĂ ===
+# === API CONFIG ===
+API_KEY = "pub_509adedfa35443b3aac899dc0fcd9f14"
+BASE_URL = "https://newsdata.io/api/1/news"
+
+# === FUNCTIE CONVERSIE ORĂ ===
 def convert_to_local_time(utc_time_str, target_tz="Europe/Bucharest"):
     try:
-        utc_dt = datetime.strptime(utc_time_str, "%a, %d %b %Y %H:%M:%S %z")
-        local_dt = utc_dt.astimezone(pytz.timezone(target_tz))
+        utc_dt = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M:%S")
+        local_dt = utc_dt.replace(tzinfo=pytz.utc).astimezone(pytz.timezone(target_tz))
         return local_dt.strftime("%d %b %Y, %H:%M")
     except Exception:
         return "N/A"
 
-# === SURSE FUNCȚIONALE ===
-feeds = {
-    "TradingEconomics": "https://tradingeconomics.com/rss/news.aspx?g=all",
-    "Investing.com": "https://www.investing.com/rss/news_301.rss",
-    "FXStreet": "https://www.fxstreet.com/rss/news",
+# === FETCH ȘTIRI ===
+query = "economy OR inflation OR interest rates OR forex OR central bank OR CPI OR GDP OR unemployment"
+params = {
+    "apikey": API_KEY,
+    "language": "en",
+    "q": query,
+    "category": "business,world,economy"
 }
 
-headers = {"User-Agent": "Mozilla/5.0"}
-events = []
+st.info("Fetching latest economic headlines...")
 
-for source, url in feeds.items():
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        feed = feedparser.parse(response.text)
-        for entry in feed.entries[:20]:
-            title = entry.title
-            published = getattr(entry, "published", "N/A")
-            impact = "Medium"
-
-            title_lower = title.lower()
-            if any(x in title_lower for x in ["high impact", "rate decision", "inflation", "cpi", "gdp", "nfp"]):
-                impact = "High"
-            elif any(x in title_lower for x in ["medium", "manufacturing", "retail", "survey"]):
-                impact = "Medium"
-            else:
-                impact = "Low"
-
-            if "usd" in title_lower or "us" in title_lower or "fed" in title_lower:
-                country = "🇺🇸 USD"
-            elif "eur" in title_lower or "euro" in title_lower or "ecb" in title_lower:
-                country = "🇪🇺 EUR"
-            elif "gbp" in title_lower or "boe" in title_lower or "uk" in title_lower or "british" in title_lower:
-                country = "🇬🇧 GBP"
-            elif "jpy" in title_lower or "yen" in title_lower or "boj" in title_lower:
-                country = "🇯🇵 JPY"
-            elif "cad" in title_lower or "canada" in title_lower:
-                country = "🇨🇦 CAD"
-            elif "aud" in title_lower or "australia" in title_lower:
-                country = "🇦🇺 AUD"
-            elif "chf" in title_lower or "swiss" in title_lower:
-                country = "🇨🇭 CHF"
-            elif "cny" in title_lower or "china" in title_lower:
-                country = "🇨🇳 CNY"
-            elif "gold" in title_lower or "xau" in title_lower:
-                country = "🥇 XAU"
-            else:
-                country = "🌍 Other"
-
-            events.append({
-                "Time (local)": convert_to_local_time(published),
-                "Country": country,
-                "Impact": impact,
-                "Event": title.strip(),
-                "Source": source
-            })
-    except Exception as e:
-        st.warning(f"⚠️ {source} feed unavailable: {e}")
-
-# === VERIFICARE ===
-if len(events) == 0:
-    st.error("No data fetched from available sources. Try again later.")
+try:
+    response = requests.get(BASE_URL, params=params, timeout=15)
+    data = response.json()
+except Exception as e:
+    st.error(f"Error fetching data: {e}")
     st.stop()
 
-# === DATAFRAME ===
+if "results" not in data or len(data["results"]) == 0:
+    st.error("No data fetched from NewsData.io. Try again later.")
+    st.stop()
+
+# === PROCESARE ===
+events = []
+for item in data["results"]:
+    title = item.get("title", "No title")
+    source = item.get("source_id", "Unknown")
+    pub_date = item.get("pubDate", "").replace("T", " ").replace("Z", "")
+
+    title_lower = title.lower()
+    impact = "Low"
+    if any(k in title_lower for k in ["interest rate", "inflation", "cpi", "gdp", "nfp", "employment", "rate decision", "central bank"]):
+        impact = "High"
+    elif any(k in title_lower for k in ["manufacturing", "survey", "retail", "growth", "market sentiment"]):
+        impact = "Medium"
+
+    if any(k in title_lower for k in ["usd", "dollar", "federal", "fed", "america"]):
+        country = "🇺🇸 USD"
+    elif any(k in title_lower for k in ["eur", "euro", "ecb", "europe"]):
+        country = "🇪🇺 EUR"
+    elif any(k in title_lower for k in ["gbp", "pound", "boe", "uk", "british"]):
+        country = "🇬🇧 GBP"
+    elif any(k in title_lower for k in ["jpy", "yen", "boj", "japan"]):
+        country = "🇯🇵 JPY"
+    elif any(k in title_lower for k in ["gold", "xau"]):
+        country = "🥇 XAU"
+    else:
+        country = "🌍 Other"
+
+    events.append({
+        "Time (local)": convert_to_local_time(pub_date),
+        "Currency": country,
+        "Impact": impact,
+        "Headline": title,
+        "Source": source
+    })
+
 df = pd.DataFrame(events)
 
 # === FILTRE ===
 st.sidebar.header("⚙️ Filters")
-
 impact_filter = st.sidebar.multiselect(
     "Select impact level:",
     options=["High", "Medium", "Low"],
     default=["High", "Medium"]
 )
-
-country_filter = st.sidebar.multiselect(
-    "Select countries:",
-    options=sorted(df["Country"].unique()),
-    default=sorted(df["Country"].unique())
-)
-
-source_filter = st.sidebar.multiselect(
-    "Select news sources:",
-    options=sorted(df["Source"].unique()),
-    default=sorted(df["Source"].unique())
+currency_filter = st.sidebar.multiselect(
+    "Select currencies:",
+    options=sorted(df["Currency"].unique()),
+    default=sorted(df["Currency"].unique())
 )
 
 filtered_df = df[
     (df["Impact"].isin(impact_filter)) &
-    (df["Country"].isin(country_filter)) &
-    (df["Source"].isin(source_filter))
+    (df["Currency"].isin(currency_filter))
 ]
 
-filtered_df = filtered_df.sort_values(by="Time (local)", ascending=True)
+filtered_df = filtered_df.sort_values(by="Time (local)", ascending=False)
 
-# === CULOARE IMPACT ===
+# === STILIZARE ===
 def color_impact(val):
     if val == "High":
         color = "#D44D5C"
@@ -131,6 +117,20 @@ st.dataframe(
     height=650
 )
 
-if st.button("🔄 Refresh Calendar"):
-    st.rerun()
+# === REZUMAT SUS ===
+st.markdown("---")
+st.subheader("📊 Summary of current news bias")
+count_high = len(df[df["Impact"] == "High"])
+count_medium = len(df[df["Impact"] == "Medium"])
+count_low = len(df[df["Impact"] == "Low"])
 
+top_currency = df["Currency"].value_counts().idxmax()
+
+st.write(
+    f"**High Impact:** {count_high} | **Medium:** {count_medium} | **Low:** {count_low} | "
+    f"**Most Active Currency:** {top_currency}"
+)
+
+# === BUTON REFRESH ===
+if st.button("🔄 Refresh Data"):
+    st.rerun()
