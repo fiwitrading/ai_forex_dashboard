@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import feedparser
 import streamlit as st
 import pandas as pd
@@ -22,7 +25,7 @@ st.markdown(
 st_autorefresh(interval=600000, key="datarefresh")
 
 # === USER TUNABLE SETTINGS ===
-with st.expander("Settings (feeds, items per feed, source weights)", True):
+with st.expander("Settings (feeds, items per feed, source weights, macro tuning)", True):
     items_per_feed = st.number_input("Items per feed (max per source)", min_value=3, max_value=50, value=8, step=1)
     recency_half_life_hours = st.number_input("Recency half-life (hours) — how fast old articles lose weight", min_value=1, max_value=168, value=72)
     # Source priority weights (can be extended)
@@ -35,9 +38,11 @@ with st.expander("Settings (feeds, items per feed, source weights)", True):
         "Forex Factory": 0.9,
         "Default": 1.0
     }
+    st.markdown("Macro tuning:")
+    macro_influence = st.slider("Macro influence on bias (gamma)", min_value=0.0, max_value=1.0, value=0.25, step=0.01)
+    st.caption("Cât de mult influențează evenimentele macro scorul agregat al perechii (0 = ignoră, 1 = puternic).")
 
 # === RSS FEEDS ===
-# You can add/remove feeds here
 rss_feeds = {
     "Investing.com": "https://www.investing.com/rss/news_301.rss",
     "Bloomberg Economics": "https://feeds.bloomberg.com/economics/news.rss",
@@ -49,13 +54,52 @@ rss_feeds = {
 
 # === KEYWORDS / LABELS PER PAIR ===
 PAIR_KEYWORDS = {
-    "EUR/USD": ["eurusd", "euro", "ecb", "europe", "eurozone", "european central bank", "eurostat", "bundesbank", "eur"],
-    "GBP/USD": ["gbpusd", "pound", "sterling", "bank of england", "boe", "uk", "united kingdom", "britain", "gbp"],
+    "EUR/USD": ["eurusd", "euro", "ecb", "eurozone", "european central bank", "eurostat", "bundesbank", "eur"],
+    "GBP/USD": ["gbpusd", "pound", "sterling", "bank of england", "boe", "uk", "britain", "gbp"],
     "USD/JPY": ["usdjpy", "yen", "boj", "bank of japan", "tokyo", "japan", "jpy"],
     "XAU/USD": ["gold", "xau", "spot gold", "precious metal", "gold price", "xauusd"],
 }
-
 PAIR_LABELS = list(PAIR_KEYWORDS.keys())
+
+# Pair base/quote mapping
+PAIR_BASE_QUOTE = {
+    "EUR/USD": ("EUR", "USD"),
+    "GBP/USD": ("GBP", "USD"),
+    "USD/JPY": ("USD", "JPY"),
+    "XAU/USD": ("XAU", "USD")
+}
+
+# === MACRO EVENT KEYWORDS ===
+MACRO_KEYWORDS = {
+    "cpi": "USD",
+    "consumer price": "USD",
+    "inflation": "USD",
+    "nfp": "USD",
+    "nonfarm": "USD",
+    "unemployment": "USD",
+    "jobs report": "USD",
+    "gdp": "USD",
+    "fed": "USD",
+    "fomc": "USD",
+    "interest rate": "USD",
+    "rate decision": "USD",
+    "ecb": "EUR",
+    "euro area": "EUR",
+    "bank of england": "GBP",
+    "boj": "JPY",
+    "japan": "JPY",
+    "uk": "GBP",
+    "britain": "GBP",
+    "pound": "GBP"
+}
+
+POSITIVE_SIGNS = [
+    "beats", "better than expected", "strong", "stronger", "tops expectations", "higher than expected",
+    "surprise up", "revised up", "rise", "risen", "upbeat", "positive", "hike", "raises", "raised", "rate hike", "increases"
+]
+NEGATIVE_SIGNS = [
+    "misses", "below expectations", "weaker", "lower than expected", "disappoint", "falls", "fell", "down", "cut", "cuts", "cut rates", "eases", "negative", "revised down"
+]
 
 # === UTIL: text cleaning ===
 def clean_text(text: str) -> str:
@@ -71,7 +115,6 @@ def get_sentiment_pipeline():
     try:
         return pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment")
     except Exception:
-        # Fallback to a more generic model if unavailable
         return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 
 @st.cache_resource(ttl=3600)
@@ -88,6 +131,7 @@ def get_summarizer_pipeline():
     except Exception:
         return None
 
+# Load pipelines
 sentiment_pipeline = get_sentiment_pipeline()
 zero_shot = get_zero_shot_pipeline()
 summarizer = get_summarizer_pipeline()
@@ -107,7 +151,6 @@ for name, url in rss_feeds.items():
             summary = clean_text(getattr(entry, "summary", "") or getattr(entry, "description", "") or "")
             link = getattr(entry, "link", "")
             published = None
-            # try multiple published fields
             if hasattr(entry, "published_parsed") and entry.published_parsed:
                 published = datetime.datetime.fromtimestamp(time.mktime(entry.published_parsed))
             elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
@@ -118,7 +161,6 @@ for name, url in rss_feeds.items():
                 except Exception:
                     published = None
 
-            # fallback: items without title are ignored
             if not title:
                 continue
 
@@ -145,28 +187,21 @@ def match_pair_by_keywords(text: str) -> str:
                 return pair
     return None
 
-# Precompute combined text for classification
 for n in news_items:
     combined = f"{n['title']} . {n['summary']}"
     n["text"] = combined
-
-# First pass: keyword matching
-for n in news_items:
-    pair = match_pair_by_keywords(n["text"])
+    pair = match_pair_by_keywords(combined)
     n["pair"] = pair if pair else "Other"
 
-# For items not matched by keywords, use zero-shot classification if available
+# Zero-shot classification for unmatched items
 unmatched = [n for n in news_items if n["pair"] == "Other"]
 if zero_shot and len(unmatched) > 0:
     try:
         texts = [u["text"] for u in unmatched]
-        # zero-shot supports batch
         z_results = zero_shot(texts, PAIR_LABELS, multi_label=False)
-        # z_results can be a dict for single input or list for many
         if isinstance(z_results, dict):
             z_results = [z_results]
         for u, res in zip(unmatched, z_results):
-            # assign top label only if score reasonably high (>=0.3)
             label = res["labels"][0]
             score = res["scores"][0]
             if score >= 0.3:
@@ -174,44 +209,93 @@ if zero_shot and len(unmatched) > 0:
     except Exception:
         pass
 
-# === 3. SENTIMENT ANALYSIS (batch) ===
-# Use pipeline in batch mode to be faster
+# === 3. MACRO EVENT DETECTION ===
+def detect_macro_events_in_text(text: str) -> List[Dict]:
+    t = text.lower()
+    found = []
+    for kw, cur in MACRO_KEYWORDS.items():
+        if kw in t:
+            signal = 0.0
+            for pw in POSITIVE_SIGNS:
+                if pw in t:
+                    signal += 1.0
+            for nw in NEGATIVE_SIGNS:
+                if nw in t:
+                    signal -= 1.0
+            if signal > 0:
+                signal = min(1.0, signal)
+            elif signal < 0:
+                signal = max(-1.0, signal)
+            else:
+                signal = 0.25
+            found.append({"event": kw, "currency": cur, "signal": signal})
+    return found
+
+for n in news_items:
+    n["macro_events"] = detect_macro_events_in_text(n["text"])
+
+# Parse ForexFactory calendar entries to augment macro events
+try:
+    factory_feed = feedparser.parse("https://www.forexfactory.com/ffcal_week_this.xml")
+    for entry in factory_feed.entries[:80]:
+        title = getattr(entry, "title", "") or ""
+        txt = title.lower()
+        matched = any(kw in txt for kw in MACRO_KEYWORDS.keys())
+        if matched:
+            events = detect_macro_events_in_text(txt)
+            published = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                published = datetime.datetime.fromtimestamp(time.mktime(entry.published_parsed))
+            news_items.append({
+                "source": "Forex Factory (calendar)",
+                "title": title,
+                "summary": "",
+                "link": getattr(entry, "link", ""),
+                "published": published,
+                "text": txt,
+                "pair": "Other",
+                "macro_events": events
+            })
+except Exception:
+    pass
+
+# === 4. SENTIMENT ANALYSIS (batch) ===
 texts = [n["title"] for n in news_items]
 sent_results = []
 try:
     sent_results = sentiment_pipeline(texts, truncation=True)
 except Exception:
-    # fallback to single evaluation if batching fails
-    sent_results = [sentiment_pipeline(t) for t in texts]
+    # fallback: single calls
+    for t in texts:
+        try:
+            r = sentiment_pipeline(t)
+            sent_results.append(r)
+        except Exception:
+            sent_results.append([{"label": "NEUTRAL", "score": 0.5}])
 
-# Map sentiment labels to numeric polarity
 def sentiment_to_numeric(label: str) -> float:
     lab = label.lower()
     if "positive" in lab or "pos" in lab:
         return 1.0
     if "negative" in lab or "neg" in lab:
         return 0.0
-    # neutral or others
     return 0.5
 
-# Attach sentiment to news_items
 for n, s in zip(news_items, sent_results):
-    # s may be dict or list depending on pipeline call
     if isinstance(s, list):
         s = s[0]
-    label = s.get("label", "")
-    score = float(s.get("score", 0.0))
+    label = s.get("label", "") if isinstance(s, dict) else ""
+    score = float(s.get("score", 0.0)) if isinstance(s, dict) else 0.0
     n["sent_label"] = label
     n["sent_score"] = score
     n["sent_value"] = sentiment_to_numeric(label)
 
-# === 4. WEIGHTING: recency and source weight ===
+# === 5. WEIGHTING: recency and source weight ===
 def recency_weight(published: datetime.datetime, half_life_hours: float) -> float:
     if published is None:
-        return 0.2  # low weight for unknown time
+        return 0.2
     age_hours = max((now - published).total_seconds() / 3600.0, 0.0)
-    # exponential decay: weight = 0.5 at half_life_hours
-    lam = - (1.0 / half_life_hours) * (0.693147)  # ln(0.5) approx -0.693147
+    lam = - (1.0 / half_life_hours) * 0.693147
     weight = exp(lam * age_hours)
     return weight
 
@@ -220,8 +304,8 @@ for n in news_items:
     r_w = recency_weight(n.get("published"), recency_half_life_hours)
     n["weight"] = src_w * r_w
 
-# === 5. AGGREGARE PER PERECHE ===
-pairs = PAIR_LABELS.copy()  # only known pairs
+# === 6. AGGREGARE PER PERECHE + APLICARE EFECT MACRO ===
+pairs = PAIR_LABELS.copy()
 agg = {}
 for p in pairs:
     items = [n for n in news_items if n["pair"] == p]
@@ -229,88 +313,120 @@ for p in pairs:
         agg[p] = {
             "count": 0,
             "weighted_score": 0.5,
+            "adjusted_score": 0.5,
             "bias": "Neutral",
             "color": "#D4D4D4",
             "top_titles": [],
             "pos": 0, "neu": 0, "neg": 0,
-            "explanation": "No recent news matched this pair."
+            "explanation": "No recent news matched this pair.",
+            "macro_effect": 0.0,
+            "macro_events": []
         }
         continue
 
-    # weighted average of sent_value
     weighted_sum = sum(n["sent_value"] * n["weight"] for n in items)
     total_w = sum(n["weight"] for n in items) or 1.0
     weighted_score = weighted_sum / total_w
 
-    # counts
     pos = sum(1 for n in items if n["sent_value"] > 0.75)
     neu = sum(1 for n in items if 0.4 <= n["sent_value"] <= 0.75)
     neg = sum(1 for n in items if n["sent_value"] < 0.4)
 
-    # bias thresholds (customizable)
-    if weighted_score >= 0.62:
+    sorted_items = sorted(items, key=lambda x: x.get("weight", 0.0) * x.get("sent_score", 0.0), reverse=True)
+    top_titles = [{
+        "title": s["title"],
+        "link": s["link"],
+        "source": s["source"],
+        "published": s["published"].strftime("%Y-%m-%d %H:%M") if pd.notnull(s.get("published")) else "N/A",
+        "sent_label": s.get("sent_label", ""),
+        "sent_score": round(s.get("sent_score", 0.0), 3),
+        "weight": round(s.get("weight", 0.0), 3)
+    } for s in sorted_items[:5]]
+
+    explanation = ""
+    if summarizer and len(sorted_items) > 0:
+        try:
+            concat = " ".join(t["title"] for t in sorted_items[:6])
+            summary = summarizer(concat, max_length=50, min_length=15, do_sample=False)[0]["summary_text"]
+            explanation = summary
+        except Exception:
+            explanation = sorted_items[0]["title"]
+    else:
+        explanation = sorted_items[0]["title"]
+
+    # MACRO EFFECTS
+    macro_effect_sum = 0.0
+    macro_events_list = []
+    for n in items:
+        for ev in n.get("macro_events", []):
+            cur = ev.get("currency")
+            signal = ev.get("signal", 0.0)
+            base, quote = PAIR_BASE_QUOTE.get(p, (None, None))
+            if base is None or quote is None:
+                continue
+            effect_on_pair = 0.0
+            if cur == base:
+                effect_on_pair = signal
+            elif cur == quote:
+                effect_on_pair = -signal
+            else:
+                effect_on_pair = 0.0
+            macro_effect_sum += effect_on_pair * n.get("weight", 1.0)
+            if abs(signal) > 0:
+                macro_events_list.append({
+                    "title": n["title"],
+                    "event": ev.get("event"),
+                    "currency": cur,
+                    "signal": signal,
+                    "weight": n.get("weight", 1.0),
+                    "published": n.get("published")
+                })
+
+    macro_effect_norm = macro_effect_sum / (total_w or 1.0)
+
+    adjusted_score = weighted_score + macro_influence * macro_effect_norm
+    adjusted_score = max(0.0, min(1.0, adjusted_score))
+
+    if adjusted_score >= 0.62:
         bias = "Bullish"
         color = "#16C47F"
-    elif weighted_score <= 0.38:
+    elif adjusted_score <= 0.38:
         bias = "Bearish"
         color = "#D44D5C"
     else:
         bias = "Neutral"
         color = "#D4D4D4"
 
-    # top titles by weight
-    sorted_items = sorted(items, key=lambda x: x["weight"] * x["sent_score"], reverse=True)
-    top_titles = [{
-        "title": s["title"],
-        "link": s["link"],
-        "source": s["source"],
-        "published": s["published"].strftime("%Y-%m-%d %H:%M") if s.get("published") else "N/A",
-        "sent_label": s["sent_label"],
-        "sent_score": round(s["sent_score"], 3),
-        "weight": round(s["weight"], 3)
-    } for s in sorted_items[:5]]
-
-    # short explanation: try to summarize top titles or build explanation heuristically
-    explanation = ""
-    if summarizer and len(sorted_items) > 0:
-        try:
-            # feed concatenated top titles to summarizer
-            concat = " ".join(t["title"] for t in sorted_items[:6])
-            # summarizer expects longer text; guard length
-            summary = summarizer(concat, max_length=50, min_length=15, do_sample=False)[0]["summary_text"]
-            explanation = summary
-        except Exception:
-            explanation = sorted_items[0]["title"]
-    else:
-        # heuristic explanation from top items
-        explanation = sorted_items[0]["title"]
-
     agg[p] = {
         "count": len(items),
         "weighted_score": round(weighted_score, 3),
+        "adjusted_score": round(adjusted_score, 3),
         "bias": bias,
         "color": color,
         "top_titles": top_titles,
         "pos": pos, "neu": neu, "neg": neg,
-        "explanation": explanation
+        "explanation": explanation,
+        "macro_effect": round(macro_effect_norm, 4),
+        "macro_events": macro_events_list
     }
 
-# === 6. UI: Cards with richer info ===
+# === 7. UI: Cards with macro info ===
 cols = st.columns(len(pairs))
 for i, p in enumerate(pairs):
     card = agg[p]
     with cols[i]:
         st.markdown(
             f"""
-            <div style="background-color:#0C0F11; padding:15px; border-radius:12px; border:1px solid #1E242A; min-height:200px;">
+            <div style="background-color:#0C0F11; padding:15px; border-radius:12px; border:1px solid #1E242A; min-height:220px;">
                 <h3 style="color:white; text-align:center;">{p}</h3>
-                <h4 style="color:{card['color']}; text-align:center;">{card['bias']} ({int(card['weighted_score']*100)}%)</h4>
-                <div style="background:#1E242A; border-radius:10px; height:12px;">
-                    <div style="width:{int(card['weighted_score']*100)}%; background:{card['color']}; height:12px; border-radius:10px;"></div>
+                <h4 style="color:{card['color']}; text-align:center;">{card['bias']} ({int(card['adjusted_score']*100)}%)</h4>
+                <div style="background:#1E242A; border-radius:10px; height:12px; margin-bottom:8px;">
+                    <div style="width:{int(card['adjusted_score']*100)}%; background:{card['color']}; height:12px; border-radius:10px;"></div>
                 </div>
-                <p style="color:gray; margin-top:8px; font-size:13px;">Mentions (recent): {card['count']}</p>
+                <p style="color:gray; margin-top:4px; font-size:13px;">Mentions (recent): {card['count']}</p>
                 <p style="color:#A9B2BA; font-size:13px;">💡 AI Rationale: {card['explanation']}</p>
                 <p style="color:#9AA3AA; font-size:12px; margin-top:6px;">Pos/Neu/Neg: {card['pos']}/{card['neu']}/{card['neg']}</p>
+                <p style="color:#9AA3AA; font-size:12px; margin-top:6px;">Macro effect: {card['macro_effect']}</p>
             </div>
             """,
             unsafe_allow_html=True
@@ -318,7 +434,7 @@ for i, p in enumerate(pairs):
 
 st.markdown("---")
 
-# === 7. DETAILED VIEW PER PERECHE ===
+# === 8. DETAILED VIEW PER PERECHE ===
 st.subheader("🔎 Detalii pe pereche")
 sel = st.selectbox("Select pair", options=["All"] + pairs, index=0)
 
@@ -330,14 +446,20 @@ def render_items_for_pair(pair_name: str):
     if df_view.empty:
         st.info("No items for this selection.")
         return
-    # show selected columns and add link as markdown
-    df_view = df_view[["published", "source", "title", "sent_label", "sent_score", "weight", "pair", "link"]]
+    df_view = df_view[["published", "source", "title", "sent_label", "sent_score", "weight", "pair", "link", "macro_events"]]
     df_view = df_view.sort_values(by="published", ascending=False)
-    # render as table with clickable links
     for _, row in df_view.iterrows():
         published = row["published"].strftime("%Y-%m-%d %H:%M") if pd.notnull(row["published"]) else "N/A"
+        macro_events = row["macro_events"] if isinstance(row["macro_events"], list) else []
+        macro_str = ""
+        if macro_events:
+            macro_parts = []
+            for me in macro_events:
+                if isinstance(me, dict):
+                    macro_parts.append(f"{me.get('event')} ({me.get('currency')}: {me.get('signal')})")
+            macro_str = " | Macro: " + ", ".join(macro_parts)
         st.markdown(
-            f"- **{row['title']}**  \n  Source: *{row['source']}* | Published: {published} | Sentiment: **{row['sent_label']}** ({round(row['sent_score'],3)})  \n  [Open article]({row['link']})"
+            f"- **{row['title']}**  \n  Source: *{row['source']}* | Published: {published} | Sentiment: **{row['sent_label']}** ({round(row['sent_score'],3)})  {macro_str}  \n  [Open article]({row['link']})"
         )
 
 if sel == "All":
@@ -347,30 +469,33 @@ else:
     st.markdown(f"Showing items classified for **{sel}**")
     render_items_for_pair(sel)
 
-# === 8. ECONOMIC EVENTS (Forex Factory / Calendar) ===
+# === 9. ECONOMIC EVENTS (Forex Factory / Calendar) ===
 st.markdown("---")
 st.subheader("🗓️ Upcoming High & Medium Impact Events (from ForexFactory feed)")
-factory_feed = feedparser.parse("https://www.forexfactory.com/ffcal_week_this.xml")
 events = []
-for entry in factory_feed.entries[:60]:
-    title = getattr(entry, "title", "")
-    txt = title.lower()
-    impact = None
-    if "high impact" in txt or "high" in txt and ("impact" in txt or "expected" in txt):
-        impact = "🔥 High Impact"
-    elif "medium impact" in txt or "medium" in txt:
-        impact = "⚠️ Medium Impact"
+try:
+    factory_feed = feedparser.parse("https://www.forexfactory.com/ffcal_week_this.xml")
+    for entry in factory_feed.entries[:60]:
+        title = getattr(entry, "title", "") or ""
+        txt = title.lower()
+        impact = None
+        if "high impact" in txt or ("high" in txt and ("impact" in txt or "expected" in txt)):
+            impact = "🔥 High Impact"
+        elif "medium impact" in txt or "medium" in txt:
+            impact = "⚠️ Medium Impact"
 
-    if impact:
-        published = None
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            published = datetime.datetime.fromtimestamp(time.mktime(entry.published_parsed))
-        events.append({
-            "Event": title,
-            "Impact": impact,
-            "Time": published.strftime("%Y-%m-%d %H:%M") if published else "N/A",
-            "Link": getattr(entry, "link", "")
-        })
+        if impact:
+            published = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                published = datetime.datetime.fromtimestamp(time.mktime(entry.published_parsed))
+            events.append({
+                "Event": title,
+                "Impact": impact,
+                "Time": published.strftime("%Y-%m-%d %H:%M") if published else "N/A",
+                "Link": getattr(entry, "link", "")
+            })
+except Exception:
+    pass
 
 if events:
     st.table(pd.DataFrame(events))
